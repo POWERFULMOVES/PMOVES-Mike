@@ -425,6 +425,28 @@ async function claimedStoragePaths(
             claim(row.storage_path);
             claim(row.pdf_storage_path);
         }
+
+        // A public playbook handed to the organization keeps its files under
+        // the departed creator's prefix.
+        const [playbooks, playbookSources] = await Promise.all([
+            db
+                .from("playbooks")
+                .select("source_storage_key")
+                .in("source_storage_key", batch),
+            db
+                .from("playbook_sources")
+                .select("storage_key")
+                .in("storage_key", batch),
+        ]);
+        await throwIfError(playbooks.error, "Failed to classify playbook files");
+        await throwIfError(
+            playbookSources.error,
+            "Failed to classify playbook source files",
+        );
+        for (const row of (playbooks.data ?? []) as Record<string, unknown>[])
+            claim(row.source_storage_key);
+        for (const row of (playbookSources.data ?? []) as Record<string, unknown>[])
+            claim(row.storage_key);
     }
 
     return claimed;
@@ -450,6 +472,10 @@ async function deleteOrphanedUserStorage(db: Db, userId: string) {
             ...new Set([
                 ...(await listFiles(`documents/${userId}/`)),
                 ...(await listFiles(`workflow-references/${userId}/`)),
+                // Playbook files, plus staged imports and source uploads that
+                // an interrupted request never consumed: no row or trigger
+                // owns those.
+                ...(await listFiles(`playbooks/${userId}/`)),
             ]),
         ];
         if (paths.length === 0) return;
@@ -671,27 +697,94 @@ export async function deleteUserOrganizations(
     }
 }
 
-export async function deleteAllUserChats(db: Db, userId: string) {
+/**
+ * The chats a user started in one workspace: an organization's (`orgId`), or
+ * Personal's (`orgId` null), matching public.workspace_matches. Settings'
+ * "Delete all" works on the active workspace only, so clearing Personal
+ * history never reaches a firm's, nor one firm's another's.
+ */
+export async function deleteAllUserChats(
+    db: Db,
+    userId: string,
+    orgId: string | null,
+) {
     // Conversation BEFORE DELETE triggers fence in-flight curator promotion
     // in the same transaction, including Word chats removed by document
-    // cascades. No pre-enumeration is needed, so new children cannot slip
-    // between a scan and deletion.
-    const [assistantChats, tabularChats, wordDocuments] = await Promise.all([
-        db.from("chats").delete().eq("user_id", userId),
-        db.from("tabular_review_chats").delete().eq("user_id", userId),
-        db.from("word_documents").delete().eq("user_id", userId),
+    // cascades. An assistant chat carries its workspace (a project chat its
+    // project's), so it is deleted by filter, with no pre-enumeration for a
+    // new one to slip past. Word chats exist only in Personal: the add-in
+    // works nowhere else.
+    const assistantChats = db.from("chats").delete().eq("user_id", userId);
+    const [assistantResult, wordResult] = await Promise.all([
+        orgId
+            ? assistantChats.eq("org_id", orgId)
+            : assistantChats.is("org_id", null),
+        orgId
+            ? Promise.resolve({ error: null })
+            : db.from("word_documents").delete().eq("user_id", userId),
     ]);
 
-    await throwIfError(assistantChats.error, "Failed to delete assistant chats");
-    await throwIfError(tabularChats.error, "Failed to delete tabular chats");
-    await throwIfError(wordDocuments.error, "Failed to delete Word chats");
+    await throwIfError(assistantResult.error, "Failed to delete assistant chats");
+    await throwIfError(wordResult.error, "Failed to delete Word chats");
+    await deleteUserTabularReviewChats(db, userId, orgId);
 }
 
-export async function deleteAllUserTabularReviews(db: Db, userId: string) {
-    const { data: reviews, error: reviewsError } = await db
-        .from("tabular_reviews")
-        .select("id")
+/**
+ * A tabular review chat has no workspace of its own; it is in its review's.
+ * The user's chats on other people's reviews count too, as in the
+ * unscoped delete this replaced.
+ */
+async function deleteUserTabularReviewChats(
+    db: Db,
+    userId: string,
+    orgId: string | null,
+) {
+    const { data: chats, error: chatsError } = await db
+        .from("tabular_review_chats")
+        .select("id, review_id")
         .eq("user_id", userId);
+    await throwIfError(chatsError, "Failed to load tabular chats");
+    const rows = (chats ?? []) as {
+        id: string | null;
+        review_id: string | null;
+    }[];
+
+    const reviewsInWorkspace = new Set<string>();
+    for (const batch of chunkArray(
+        uniqueStrings(rows.map((row) => row.review_id)),
+        DELETE_BATCH_SIZE,
+    )) {
+        const reviews = db.from("tabular_reviews").select("id").in("id", batch);
+        const { data, error } = await (orgId
+            ? reviews.eq("org_id", orgId)
+            : reviews.is("org_id", null));
+        await throwIfError(error, "Failed to load tabular reviews");
+        for (const row of (data ?? []) as { id: string | null }[]) {
+            if (row.id) reviewsInWorkspace.add(row.id);
+        }
+    }
+
+    await deleteByIds(
+        db,
+        "tabular_review_chats",
+        uniqueStrings(
+            rows
+                .filter((row) => !!row.review_id && reviewsInWorkspace.has(row.review_id))
+                .map((row) => row.id),
+        ),
+    );
+}
+
+/** The tabular reviews a user owns in one workspace (`orgId` null is Personal). */
+export async function deleteAllUserTabularReviews(
+    db: Db,
+    userId: string,
+    orgId: string | null,
+) {
+    const owned = db.from("tabular_reviews").select("id").eq("user_id", userId);
+    const { data: reviews, error: reviewsError } = await (orgId
+        ? owned.eq("org_id", orgId)
+        : owned.is("org_id", null));
     await throwIfError(reviewsError, "Failed to load tabular reviews");
 
     const reviewIds = uniqueStrings(
@@ -704,6 +797,82 @@ export async function deleteAllUserTabularReviews(db: Db, userId: string) {
     await deleteByIds(db, "tabular_reviews", reviewIds);
 
     return reviewIds.length;
+}
+
+/**
+ * Hand each organization-public playbook this user created to an owner of
+ * that organization before the account goes.
+ *
+ * `playbooks.user_id` is NOT NULL and cascades from auth.users, so unlike a
+ * project or workflow a playbook cannot be detached to a null creator: left
+ * alone, the firm's published policy would vanish with whoever first wrote
+ * it. The organization's owners already own every public playbook, so the
+ * creator moves to the same successor the departure functions pick for the
+ * rest of a leaver's work. A private playbook is not the organization's and
+ * is deleted with the account, matching docs/playbooks.md.
+ */
+async function handOverOrgPlaybooks(db: Db, userId: string) {
+    const { data, error } = await db
+        .from("playbooks")
+        .select("id, org_id")
+        .eq("user_id", userId)
+        .eq("visibility", "organization")
+        .not("org_id", "is", null);
+    await throwIfError(error, "Failed to load organization playbooks");
+
+    const orgIds = uniqueStrings(
+        ((data ?? []) as { org_id?: string | null }[]).map(
+            (row) => row.org_id ?? null,
+        ),
+    );
+    for (const orgId of orgIds) {
+        const successor = await db.rpc("org_default_departure_successor", {
+            p_org_id: orgId,
+            p_departing: [userId],
+        });
+        await throwIfError(successor.error, "Failed to find a playbook successor");
+        // No other owner: nobody is left to own it, so it goes with the account.
+        if (typeof successor.data !== "string" || !successor.data) continue;
+        const { error: updateError } = await db
+            .from("playbooks")
+            .update({ user_id: successor.data })
+            .eq("user_id", userId)
+            .eq("org_id", orgId)
+            .eq("visibility", "organization");
+        await throwIfError(updateError, "Failed to hand over organization playbooks");
+    }
+}
+
+/**
+ * Delete the playbooks this user created (after handOverOrgPlaybooks kept the
+ * organization's), the reviews and imports they ran on anyone's playbook, and
+ * the shares addressed to their email. The parent delete cascades runs,
+ * sources, shares and overrides; the playbook storage triggers queue durable
+ * cleanup of the imported file and every supplementary file in the same
+ * transaction. deleteOrphanedUserStorage clears the same bytes promptly.
+ */
+async function deleteUserPlaybooks(
+    db: Db,
+    userId: string,
+    userEmail?: string | null,
+) {
+    const normalizedEmail = userEmail?.trim().toLowerCase();
+    const results = await Promise.all([
+        db.from("playbook_runs").delete().eq("user_id", userId),
+        db.from("playbook_imports").delete().eq("user_id", userId),
+        normalizedEmail
+            ? db
+                  .from("playbook_shares")
+                  .delete()
+                  .eq("shared_with_email", normalizedEmail)
+            : Promise.resolve({ error: null }),
+    ]);
+    for (const result of results) {
+        await throwIfError(result.error, "Failed to delete playbook data");
+    }
+
+    const { error } = await db.from("playbooks").delete().eq("user_id", userId);
+    await throwIfError(error, "Failed to delete playbooks");
 }
 
 /**
@@ -724,58 +893,37 @@ export async function deleteProjectsByIds(db: Db, projectIds: string[]) {
 }
 
 /**
- * Remove the projects a user created — but only the personal ones.
+ * Destroy the projects a user created in one workspace (`orgId` null is
+ * Personal), with everything inside them.
  *
- * A project that belongs to an organization is the organization's, not the
- * creator's: the firm's other owners and admins are still administering it and its
- * matter documents are still live. Those projects are DETACHED instead
- * (user_id → NULL, which the nullable FK now permits) so they survive their
- * creator's departure with their contents intact. Only `org_id IS NULL`
- * projects — the genuinely personal ones — are destroyed.
- *
- * The return value counts destroyed projects, so a caller deleting a single
- * org project sees 0 and can report "nothing was removed" accurately.
+ * In an organization this is what deleting each one would do: its creator is
+ * its owner (public.project_access_role), and an owner may delete it. Other
+ * members' projects, and the projects of other workspaces, are untouched.
  */
 export async function deleteUserProjects(
     db: Db,
     userId: string,
-    projectIds?: string[],
+    orgId: string | null,
 ) {
-    const requestedProjectIds = projectIds
-        ? uniqueStrings(projectIds)
-        : undefined;
-    if (requestedProjectIds && requestedProjectIds.length === 0) return 0;
-
-    let query = db.from("projects").select("id, org_id").eq("user_id", userId);
-    if (requestedProjectIds) query = query.in("id", requestedProjectIds);
-
-    const { data: projects, error: projectsError } = await query;
+    const created = db.from("projects").select("id").eq("user_id", userId);
+    const { data: projects, error: projectsError } = await (orgId
+        ? created.eq("org_id", orgId)
+        : created.is("org_id", null));
     await throwIfError(projectsError, "Failed to load user projects");
 
-    const rows = (projects ?? []) as {
-        id: string | null;
-        org_id?: string | null;
-    }[];
-    const personalProjectIds = uniqueStrings(
-        rows.filter((row) => !row.org_id).map((row) => row.id),
+    return deleteProjectsByIds(
+        db,
+        ((projects ?? []) as { id: string | null }[])
+            .map((row) => row.id)
+            .filter((id): id is string => !!id),
     );
-    const orgProjectIds = uniqueStrings(
-        rows.filter((row) => !!row.org_id).map((row) => row.id),
-    );
-
-    if (orgProjectIds.length > 0) {
-        for (const batch of chunkArray(orgProjectIds, DELETE_BATCH_SIZE)) {
-            const { error } = await db
-                .from("projects")
-                .update({ user_id: null })
-                .in("id", batch);
-            await throwIfError(error, "Failed to detach organization projects");
-        }
-    }
-
-    return deleteProjectsByIds(db, personalProjectIds);
 }
 
+/**
+ * Erase personal account data after checking organization ownership blockers.
+ * Retain organization work and contributed folder trees in surviving projects,
+ * detaching the departing user's attribution before their account is removed.
+ */
 export async function deleteUserAccountData(
     db: Db,
     userId: string,
@@ -841,15 +989,22 @@ export async function deleteUserAccountData(
     // the organization BEFORE the by-user deletions below run, so those
     // deletions no longer match the rows we are keeping.
     await detachOrgProjectContent(db, userId, orgProjectIds);
+    await handOverOrgPlaybooks(db, userId);
 
     await deleteByIds(db, "documents", documentIds);
+
+    // A contributed folder can contain other people's nested folders. Keep
+    // the tree in surviving projects; deleting owned projects below still
+    // cascades their whole tree. The nullable attribution FK survives auth deletion.
+    const { error: folderError } = await db.from("project_subfolders")
+        .update({ user_id: null }).eq("user_id", userId);
+    await throwIfError(folderError, "Failed to preserve contributed folders");
 
     const deletions = [
         db.from("tabular_review_chats").delete().eq("user_id", userId),
         db.from("tabular_reviews").delete().eq("user_id", userId),
         db.from("chats").delete().eq("user_id", userId),
         db.from("word_documents").delete().eq("user_id", userId),
-        db.from("project_subfolders").delete().eq("user_id", userId),
         db.from("hidden_workflows").delete().eq("user_id", userId),
         db
             .from("workflow_open_source_submissions")
@@ -883,6 +1038,8 @@ export async function deleteUserAccountData(
         .delete()
         .eq("user_id", userId);
     await throwIfError(workflowsError, "Failed to delete workflows");
+
+    await deleteUserPlaybooks(db, userId, userEmail);
 
     // `wipe_memory_file` empties the body under the file's row lock and bumps
     // its epoch, fencing any curator job still in flight. Organization project

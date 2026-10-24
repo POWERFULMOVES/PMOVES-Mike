@@ -17,6 +17,7 @@
 //   user.apiKeyStore.ts — the encrypted per-user API-key store itself
 //   user.settings.ts — per-user model settings + last-selected model/reasoning
 //   user.mcp.ts      — MCP connector wrappers over lib/mcpConnectors
+//   user.courtlistener.ts — CourtListener connector status, switch and token
 //   user.account.ts  — destructive account/data deletion (args + ordering kept)
 //   user.export.ts   — the durable async export flow (enqueue / poll /
 //                      download artifact); user.exportJobs.ts builds it
@@ -67,6 +68,12 @@ export {
 } from "./user.responseStyle";
 
 export {
+    getWebSearchSettings,
+    saveWebSearchSettings,
+    validateWebSearchPayload,
+} from "./user.webSearch";
+
+export {
     getApiKeyStatus,
     saveApiKey,
     saveApiKeyForOwner,
@@ -82,6 +89,12 @@ export {
     refreshMcpConnectorTools,
     setMcpToolEnabled,
 } from "./user.mcp";
+
+export {
+    courtListenerConnectorStatus,
+    setCourtListenerEnabled,
+    setCourtListenerToken,
+} from "./user.courtlistener";
 
 export {
     deletePrivateMemories,
@@ -123,7 +136,7 @@ export { resolveUserChatSelection } from "./user.chatSelection";
 export { handleAccountDelete } from "./user.accountJobs";
 export { handleExportBuild } from "./user.exportJobs";
 export { handleMcpRefreshToken, MCP_TOKEN_REFRESH_WINDOW_MS } from "./user.mcpJobs";
-export { MAX_ZIP_EXPORT_DOCUMENTS } from "./user.exportContracts";
+export { MAX_ZIP_EXPORT_DOCUMENTS, isWorkspaceExportType } from "./user.exportContracts";
 
 export { deleteProjectsByIds } from "./user.dataCleanup";
 export { describeAccountDeletionBlockers } from "./user.account";
